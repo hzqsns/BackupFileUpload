@@ -29,14 +29,14 @@
       </div>
     </div>
   </div>
-</template>
-
-<script>
+  </template>
+  
+  <script>
 export default {
   data() {
     return {
       selectedFile: null,
-      chunkSize: 10 * 1024 * 1024, // 每个切片2MB
+      chunkSize: 20 * 1024 * 1024, // 增大切片到20MB
       chunks: [],
       currentChunkIndex: 0,
       uploadId: null,
@@ -46,10 +46,20 @@ export default {
       uploadStatus: '',
       controller: null,
       uploadedChunks: [],
-      hashWorker: null,
+      hashWorkers: [], // 改为存储多个WebWorker
+      workerCount: 0, // 工作线程数量
       hashCalculationPromises: {},
       hashProgress: 0,
-      isCalculatingHash: false
+      isCalculatingHash: false,
+      performanceMetrics: {
+        totalUploadTime: 0,
+        chunkCalculationTime: 0,
+        hashCalculationTime: 0,
+        uploadTime: 0,
+        mergeTime: 0,
+        chunkTimes: []
+      },
+      uploadStartTime: 0
     }
   },
   methods: {
@@ -71,6 +81,11 @@ export default {
       this.prepareChunks();
     },
     prepareChunks() {
+      // 标记文件切片计算开始
+      if (window.performance) {
+        performance.mark('chunkCalculation-start');
+      }
+      
       const file = this.selectedFile;
       const chunkCount = Math.ceil(file.size / this.chunkSize);
       this.chunks = [];
@@ -88,6 +103,12 @@ export default {
         });
       }
       
+      // 标记文件切片计算结束并测量
+      if (window.performance) {
+        performance.mark('chunkCalculation-end');
+        performance.measure('chunkCalculation', 'chunkCalculation-start', 'chunkCalculation-end');
+      }
+      
       this.uploadStatus = `文件已分割为 ${chunkCount} 个分片，准备上传`;
       
       // 计算文件哈希
@@ -99,15 +120,28 @@ export default {
       // 如果已经在计算中则不重复计算
       if (this.isCalculatingHash) return;
       
+      // 标记哈希计算开始
+      if (window.performance) {
+        performance.mark('hashCalculation-start');
+      }
+      
       this.isCalculatingHash = true;
       this.uploadStatus = '正在计算文件哈希...';
       this.hashProgress = 0;
       
-      // 创建WebWorker
-      if (!this.hashWorker) {
-        this.hashWorker = new Worker(new URL('./hash-worker.js', import.meta.url), { type: 'module' });
+      // 创建WebWorker池 - 使用可用的CPU核心数或默认为4
+      this.workerCount = navigator.hardwareConcurrency || 4;
+      console.log(`创建${this.workerCount}个工作线程进行并行哈希计算`);
+      
+      // 清理之前的Workers (如果有)
+      this.hashWorkers.forEach(worker => worker.terminate());
+      this.hashWorkers = [];
+      
+      // 初始化WebWorker池
+      for (let i = 0; i < this.workerCount; i++) {
+        const worker = new Worker(new URL('./hash-worker.js', import.meta.url), { type: 'module' });
         
-        this.hashWorker.onmessage = (e) => {
+        worker.onmessage = (e) => {
           const { chunkIndex, hash, success, error } = e.data;
           
           if (success) {
@@ -142,11 +176,14 @@ export default {
             this.uploadStatus = `文件哈希计算完成，${this.chunks.length}个分片准备就绪`;
           }
         };
+        
+        this.hashWorkers.push(worker);
       }
       
       // 为每个分片创建一个Promise，用于等待哈希计算完成
       const hashPromises = [];
       
+      // 分配任务给不同的工作线程 - 轮询分配策略
       for (let i = 0; i < this.chunks.length; i++) {
         const chunk = this.chunks[i];
         
@@ -158,8 +195,12 @@ export default {
           
           const fileChunk = this.selectedFile.slice(chunk.start, chunk.end);
           
+          // 选择一个Worker - 轮询分配
+          const workerId = i % this.workerCount;
+          const worker = this.hashWorkers[workerId];
+          
           // 将分片发送给Worker计算哈希
-          this.hashWorker.postMessage({
+          worker.postMessage({
             fileChunk,
             chunkIndex: i
           });
@@ -169,8 +210,29 @@ export default {
       }
       
       try {
+        const startTime = Date.now();
+        
         // 等待所有哈希计算完成
         await Promise.all(hashPromises);
+        
+        const endTime = Date.now();
+        const totalTime = endTime - startTime;
+        const timePerChunk = totalTime / this.chunks.length;
+        
+        console.log(`哈希计算性能统计:
+          - 总分片数: ${this.chunks.length}
+          - 工作线程数: ${this.workerCount}
+          - 总计算时间: ${totalTime}ms
+          - 平均每片耗时: ${timePerChunk.toFixed(2)}ms
+          - 理论串行耗时: ${(timePerChunk * this.chunks.length).toFixed(2)}ms
+          - 并行加速比: ${(timePerChunk * this.chunks.length / totalTime).toFixed(2)}x
+        `);
+        
+        // 标记哈希计算结束并测量
+        if (window.performance) {
+          performance.mark('hashCalculation-end');
+          performance.measure('hashCalculation', 'hashCalculation-start', 'hashCalculation-end');
+        }
       } catch (error) {
         console.error('文件哈希计算失败:', error);
         this.uploadStatus = `文件哈希计算失败: ${error.message}`;
@@ -179,6 +241,12 @@ export default {
     },
     async startUpload() {
       if (this.isUploading && !this.isPaused) return;
+      
+      // 标记整个上传过程开始
+      if (window.performance) {
+        performance.mark('totalUpload-start');
+        this.uploadStartTime = Date.now();
+      }
       
       // 如果还在计算哈希，等待完成
       if (this.isCalculatingHash) {
@@ -304,6 +372,12 @@ export default {
       }
       
       try {
+        // 标记当前分片上传开始
+        const chunkIndex = this.currentChunkIndex;
+        if (window.performance) {
+          performance.mark(`chunkUpload-${chunkIndex}-start`);
+        }
+        
         chunk.status = 'uploading';
         const file = this.selectedFile;
         const fileChunk = file.slice(chunk.start, chunk.end);
@@ -335,6 +409,12 @@ export default {
         };
         
         xhr.onload = () => {
+          // 标记当前分片上传结束并测量
+          if (window.performance) {
+            performance.mark(`chunkUpload-${chunkIndex}-end`);
+            performance.measure(`chunkUpload-${chunkIndex}`, `chunkUpload-${chunkIndex}-start`, `chunkUpload-${chunkIndex}-end`);
+          }
+          
           if (xhr.status >= 200 && xhr.status < 300) {
             try {
               const response = JSON.parse(xhr.responseText);
@@ -419,6 +499,11 @@ export default {
     },
     async mergeChunks() {
       try {
+        // 标记合并开始
+        if (window.performance) {
+          performance.mark('mergeChunks-start');
+        }
+        
         this.uploadStatus = '所有分片上传完成，正在合并文件...';
         console.log('准备合并文件:', {
           uploadId: this.uploadId,
@@ -462,6 +547,22 @@ export default {
         this.uploadStatus = '文件上传成功！';
         this.isUploading = false;
         this.uploadId = null;
+        
+        // 标记合并结束并测量
+        if (window.performance) {
+          performance.mark('mergeChunks-end');
+          performance.measure('mergeChunks', 'mergeChunks-start', 'mergeChunks-end');
+          
+          // 标记整个上传过程结束并测量
+          performance.mark('totalUpload-end');
+          performance.measure('totalUpload', 'totalUpload-start', 'totalUpload-end');
+          
+          // 记录总上传速度
+          const totalBytes = this.selectedFile.size;
+          const totalTimeMs = Date.now() - this.uploadStartTime;
+          const speedMBps = (totalBytes / (1024 * 1024)) / (totalTimeMs / 1000);
+          console.log(`总上传速度: ${speedMBps.toFixed(2)} MB/s`);
+        }
         
         // 清除本地存储的上传状态
         localStorage.removeItem(`upload_state_${this.selectedFile.name}`);
@@ -586,17 +687,60 @@ export default {
       const i = Math.floor(Math.log(bytes) / Math.log(k));
       
       return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    },
+    // 初始化性能观察器
+    initPerformanceObserver() {
+      // 创建性能观察器
+      this.performanceObserver = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          // 根据标记名称处理不同的性能指标
+          if (entry.entryType === 'measure') {
+            if (entry.name === 'chunkCalculation') {
+              this.performanceMetrics.chunkCalculationTime = entry.duration;
+              console.log(`文件切片计算耗时: ${entry.duration.toFixed(2)}ms`);
+            } else if (entry.name === 'hashCalculation') {
+              this.performanceMetrics.hashCalculationTime = entry.duration;
+              console.log(`哈希计算耗时: ${entry.duration.toFixed(2)}ms`);
+            } else if (entry.name.startsWith('chunkUpload-')) {
+              const chunkIndex = entry.name.split('-')[1];
+              this.performanceMetrics.chunkTimes[chunkIndex] = entry.duration;
+              console.log(`分片${chunkIndex}上传耗时: ${entry.duration.toFixed(2)}ms`);
+            } else if (entry.name === 'totalUpload') {
+              this.performanceMetrics.totalUploadTime = entry.duration;
+              console.log(`总上传耗时: ${entry.duration.toFixed(2)}ms`);
+            } else if (entry.name === 'mergeChunks') {
+              this.performanceMetrics.mergeTime = entry.duration;
+              console.log(`合并文件耗时: ${entry.duration.toFixed(2)}ms`);
+            }
+          }
+        }
+      });
+      
+      // 观察所有measure类型的性能条目
+      this.performanceObserver.observe({ entryTypes: ['measure'] });
     }
   },
   mounted() {
     // 当窗口关闭时保存上传状态
     window.addEventListener('beforeunload', this.saveUploadState);
+    
+    // 初始化性能观察器
+    if (window.PerformanceObserver) {
+      this.initPerformanceObserver();
+    } else {
+      console.warn('PerformanceObserver API不可用，性能埋点将不会工作');
+    }
   },
   beforeDestroy() {
     window.removeEventListener('beforeunload', this.saveUploadState);
+    
+    // 清理性能观察器
+    if (this.performanceObserver) {
+      this.performanceObserver.disconnect();
+    }
   }
 }
-</script>
+  </script>
 
 <style lang="less" scoped>
 .container {
