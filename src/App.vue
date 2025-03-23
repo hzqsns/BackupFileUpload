@@ -33,12 +33,14 @@
   
   <script>
 import axios from 'axios';
+import HashWorkerPool from './hash-worker-pool.js';
+import { initHashWasm, isWebAssemblySupported } from './wasm-utils';
 
 export default {
   data() {
     return {
       selectedFile: null,
-      chunkSize: 20 * 1024 * 1024, // 增大切片到20MB
+      chunkSize: 10 * 1024 * 1024, // 增大切片到20MB
       chunks: [],
       currentChunkIndex: 0,
       uploadId: null,
@@ -48,8 +50,7 @@ export default {
       uploadStatus: '',
       controller: null,
       uploadedChunks: [],
-      hashWorkers: [], // 改为存储多个WebWorker
-      workerCount: 0, // 工作线程数量
+      hashWorkerPool: null,
       hashCalculationPromises: {},
       hashProgress: 0,
       isCalculatingHash: false,
@@ -59,7 +60,9 @@ export default {
         hashCalculationTime: 0,
         uploadTime: 0,
         mergeTime: 0,
-        chunkTimes: []
+        chunkTimes: [],
+        hashImplementation: '尚未执行哈希计算',
+        webassemblySupported: false,
       },
       uploadStartTime: 0
     }
@@ -131,43 +134,60 @@ export default {
       this.uploadStatus = '正在计算文件哈希...';
       this.hashProgress = 0;
       
-      // 创建WebWorker池 - 使用可用的CPU核心数或默认为4
-      this.workerCount = navigator.hardwareConcurrency || 4;
-      console.log(`创建${this.workerCount}个工作线程进行并行哈希计算`);
-      
-      // 清理之前的Workers (如果有)
-      this.hashWorkers.forEach(worker => worker.terminate());
-      this.hashWorkers = [];
-      
-      // 初始化WebWorker池
-      for (let i = 0; i < this.workerCount; i++) {
-        const worker = new Worker(new URL('./hash-worker.js', import.meta.url), { type: 'module' });
+      try {
+        // 如果hashWorkerPool不存在，则创建它
+        if (!this.hashWorkerPool) {
+          // 使用系统可用的CPU核心数创建线程池
+          this.hashWorkerPool = new HashWorkerPool();
+          console.log(`创建哈希计算线程池，线程数: ${navigator.hardwareConcurrency || 4}`);
+        }
         
-        worker.onmessage = (e) => {
-          const { chunkIndex, hash, success, error } = e.data;
+        // 准备分片数据
+        const chunksToProcess = [];
+        
+        for (let i = 0; i < this.chunks.length; i++) {
+          const chunk = this.chunks[i];
           
-          if (success) {
-            // 更新分片哈希
-            if (this.chunks[chunkIndex]) {
-              this.chunks[chunkIndex].hash = hash;
-            }
-            
-            // 解析对应的Promise
-            const promise = this.hashCalculationPromises[chunkIndex];
-            if (promise && promise.resolve) {
-              promise.resolve(hash);
-            }
-          } else {
-            console.error(`分片 ${chunkIndex} 哈希计算失败:`, error);
-            
-            // 拒绝对应的Promise
-            const promise = this.hashCalculationPromises[chunkIndex];
-            if (promise && promise.reject) {
-              promise.reject(new Error(error));
+          // 如果已经有哈希值，跳过计算
+          if (chunk.hash) continue;
+          
+          // 创建Promise，稍后用于解析计算结果
+          const hashPromise = new Promise((resolve, reject) => {
+            this.hashCalculationPromises[i] = { resolve, reject };
+          });
+          
+          // 准备分片数据
+          const fileChunk = this.selectedFile.slice(chunk.start, chunk.end);
+          chunksToProcess.push({
+            data: fileChunk,
+            index: i
+          });
+        }
+        
+        // 设置进度回调函数
+        const onProgress = ({ chunkIndex, progress, result }) => {
+          // 更新分片哈希
+          if (this.chunks[chunkIndex]) {
+            if (result && result.success) {
+              this.chunks[chunkIndex].hash = result.hash;
+              
+              // 解析对应的Promise
+              const promise = this.hashCalculationPromises[chunkIndex];
+              if (promise && promise.resolve) {
+                promise.resolve(result.hash);
+              }
+            } else if (result && !result.success) {
+              console.error(`分片 ${chunkIndex} 哈希计算失败:`, result.error);
+              
+              // 拒绝对应的Promise
+              const promise = this.hashCalculationPromises[chunkIndex];
+              if (promise && promise.reject) {
+                promise.reject(new Error(result.error));
+              }
             }
           }
           
-          // 更新哈希计算进度
+          // 更新总体进度
           this.hashProgress = (Object.keys(this.hashCalculationPromises).filter(
             index => this.chunks[index] && this.chunks[index].hash
           ).length / this.chunks.length) * 100;
@@ -179,68 +199,46 @@ export default {
           }
         };
         
-        this.hashWorkers.push(worker);
-      }
-      
-      // 为每个分片创建一个Promise，用于等待哈希计算完成
-      const hashPromises = [];
-      
-      // 分配任务给不同的工作线程 - 轮询分配策略
-      for (let i = 0; i < this.chunks.length; i++) {
-        const chunk = this.chunks[i];
+        // 如果没有分片需要处理，直接返回
+        if (chunksToProcess.length === 0) {
+          this.hashProgress = 100;
+          this.isCalculatingHash = false;
+          this.uploadStatus = `文件哈希计算完成，${this.chunks.length}个分片准备就绪`;
+          return;
+        }
         
-        // 如果已经有哈希值，跳过计算
-        if (chunk.hash) continue;
-        
-        const hashPromise = new Promise((resolve, reject) => {
-          this.hashCalculationPromises[i] = { resolve, reject };
-          
-          // 创建文件分片
-          const fileChunk = this.selectedFile.slice(chunk.start, chunk.end);
-          
-          // 在主线程中将Blob转换为ArrayBuffer
-          fileChunk.arrayBuffer().then(arrayBuffer => {
-            // 选择一个Worker - 轮询分配
-            const workerId = i % this.workerCount;
-            const worker = this.hashWorkers[workerId];
-            
-            // 将ArrayBuffer发送给Worker并使用transfer语法
-            worker.postMessage({
-              arrayBuffer,
-              chunkIndex: i
-            }, [arrayBuffer]); // 第二个参数指定transfer列表，主线程中的arrayBuffer会变得不可用
-          }).catch(error => {
-            console.error(`分片 ${i} 转换为ArrayBuffer失败:`, error);
-            reject(error);
-          });
-        });
-        
-        hashPromises.push(hashPromise);
-      }
-      
-      try {
+        // 开始计算所有分片的哈希值
         const startTime = Date.now();
         
-        // 等待所有哈希计算完成
-        await Promise.all(hashPromises);
+        await this.hashWorkerPool.computeHashesForChunks(chunksToProcess, {
+          onProgress,
+          onComplete: (stats) => {
+            // 记录哈希计算统计信息
+            if (stats && stats.hashImplementation) {
+              this.performanceMetrics.hashImplementation = stats.hashImplementation;
+            }
+          }
+        });
         
         const endTime = Date.now();
         const totalTime = endTime - startTime;
-        const timePerChunk = totalTime / this.chunks.length;
-        
-        console.log(`哈希计算性能统计:
-          - 总分片数: ${this.chunks.length}
-          - 工作线程数: ${this.workerCount}
-          - 总计算时间: ${totalTime}ms
-          - 平均每片耗时: ${timePerChunk.toFixed(2)}ms
-          - 理论串行耗时: ${(timePerChunk * this.chunks.length).toFixed(2)}ms
-          - 并行加速比: ${(timePerChunk * this.chunks.length / totalTime).toFixed(2)}x
-        `);
         
         // 标记哈希计算结束并测量
         if (window.performance) {
           performance.mark('hashCalculation-end');
           performance.measure('hashCalculation', 'hashCalculation-start', 'hashCalculation-end');
+        }
+        
+        // 从线程池获取哈希实现方式
+        const poolStats = this.hashWorkerPool.logPerformanceStats();
+        if (poolStats) {
+          if (poolStats.hashImplementation === 'wasm') {
+            this.performanceMetrics.hashImplementation = 'hash-wasm (WebAssembly)';
+          } else if (poolStats.hashImplementation === 'js') {
+            this.performanceMetrics.hashImplementation = 'SparkMD5 (JavaScript)';
+          }
+          
+          console.log(`使用的哈希实现: ${this.performanceMetrics.hashImplementation}`);
         }
       } catch (error) {
         console.error('文件哈希计算失败:', error);
@@ -718,7 +716,7 @@ export default {
       this.performanceObserver.observe({ entryTypes: ['measure'] });
     }
   },
-  mounted() {
+  async mounted() {
     // 当窗口关闭时保存上传状态
     window.addEventListener('beforeunload', this.saveUploadState);
     
@@ -728,6 +726,25 @@ export default {
     } else {
       console.warn('PerformanceObserver API不可用，性能埋点将不会工作');
     }
+    
+    // 检测WebAssembly支持
+    try {
+      const wasmSupported = isWebAssemblySupported();
+      this.performanceMetrics.webassemblySupported = wasmSupported;
+      console.log(`WebAssembly支持状态: ${wasmSupported ? '支持' : '不支持'}`);
+      
+      // 预初始化hash-wasm库
+      if (wasmSupported) {
+        const initResult = await initHashWasm();
+        if (initResult.success) {
+          console.log('成功初始化hash-wasm：', initResult.reason);
+        } else {
+          console.warn('初始化hash-wasm失败，将使用备选方案：', initResult.reason);
+        }
+      }
+    } catch (error) {
+      console.error('检测WebAssembly支持时出错：', error);
+    }
   },
   beforeDestroy() {
     window.removeEventListener('beforeunload', this.saveUploadState);
@@ -735,6 +752,11 @@ export default {
     // 清理性能观察器
     if (this.performanceObserver) {
       this.performanceObserver.disconnect();
+    }
+    
+    // 清理哈希计算线程池
+    if (this.hashWorkerPool) {
+      this.hashWorkerPool.terminate();
     }
   }
 }
