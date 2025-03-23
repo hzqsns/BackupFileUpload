@@ -32,6 +32,8 @@
   </template>
   
   <script>
+import axios from 'axios';
+
 export default {
   data() {
     return {
@@ -193,16 +195,23 @@ export default {
         const hashPromise = new Promise((resolve, reject) => {
           this.hashCalculationPromises[i] = { resolve, reject };
           
+          // 创建文件分片
           const fileChunk = this.selectedFile.slice(chunk.start, chunk.end);
           
-          // 选择一个Worker - 轮询分配
-          const workerId = i % this.workerCount;
-          const worker = this.hashWorkers[workerId];
-          
-          // 将分片发送给Worker计算哈希
-          worker.postMessage({
-            fileChunk,
-            chunkIndex: i
+          // 在主线程中将Blob转换为ArrayBuffer
+          fileChunk.arrayBuffer().then(arrayBuffer => {
+            // 选择一个Worker - 轮询分配
+            const workerId = i % this.workerCount;
+            const worker = this.hashWorkers[workerId];
+            
+            // 将ArrayBuffer发送给Worker并使用transfer语法
+            worker.postMessage({
+              arrayBuffer,
+              chunkIndex: i
+            }, [arrayBuffer]); // 第二个参数指定transfer列表，主线程中的arrayBuffer会变得不可用
+          }).catch(error => {
+            console.error(`分片 ${i} 转换为ArrayBuffer失败:`, error);
+            reject(error);
           });
         });
         
@@ -400,70 +409,59 @@ export default {
           totalChunks: this.chunks.length
         });
         
-        const xhr = new XMLHttpRequest();
-        xhr.upload.onprogress = (e) => {
-          if (e.lengthComputable) {
-            chunk.progress = Math.round((e.loaded / e.total) * 100);
-            this.calculateTotalProgress();
-          }
-        };
+        // 创建取消上传的控制器
+        const cancelTokenSource = axios.CancelToken.source();
+        chunk.cancelToken = cancelTokenSource;
         
-        xhr.onload = () => {
+        try {
+          const response = await axios.post('/api/upload/chunk', formData, {
+            headers: {
+              'Content-Type': 'multipart/form-data'
+            },
+            cancelToken: cancelTokenSource.token,
+            onUploadProgress: (progressEvent) => {
+              if (progressEvent.lengthComputable) {
+                chunk.progress = Math.round((progressEvent.loaded / progressEvent.total) * 100);
+                this.calculateTotalProgress();
+              }
+            }
+          });
+          
           // 标记当前分片上传结束并测量
           if (window.performance) {
             performance.mark(`chunkUpload-${chunkIndex}-end`);
             performance.measure(`chunkUpload-${chunkIndex}`, `chunkUpload-${chunkIndex}-start`, `chunkUpload-${chunkIndex}-end`);
           }
           
-          if (xhr.status >= 200 && xhr.status < 300) {
-            try {
-              const response = JSON.parse(xhr.responseText);
-              console.log(`分片 ${chunk.index + 1} 上传响应:`, response);
-              
-              if (response.code === 0) {
-                chunk.status = 'completed';
-                chunk.progress = 100;
-                this.uploadedChunks.push(chunk.index);
-                this.calculateTotalProgress();
-                
-                // 存储已上传的分片信息到本地存储
-                this.saveUploadState();
-                
-                this.currentChunkIndex++;
-                this.uploadNextChunk();
-              } else {
-                chunk.status = 'failed';
-                this.uploadStatus = `分片 ${chunk.index + 1} 上传失败: ${response.message}`;
-              }
-            } catch (e) {
-              console.error('解析响应失败:', e, xhr.responseText);
-              chunk.status = 'failed';
-              this.uploadStatus = `分片 ${chunk.index + 1} 上传失败: 解析响应失败`;
-            }
+          console.log(`分片 ${chunk.index + 1} 上传响应:`, response.data);
+          
+          if (response.data.code === 0) {
+            chunk.status = 'completed';
+            chunk.progress = 100;
+            this.uploadedChunks.push(chunk.index);
+            this.calculateTotalProgress();
+            
+            // 存储已上传的分片信息到本地存储
+            this.saveUploadState();
+            
+            this.currentChunkIndex++;
+            this.uploadNextChunk();
           } else {
-            console.error('上传状态错误:', xhr.status, xhr.statusText);
             chunk.status = 'failed';
-            this.uploadStatus = `分片 ${chunk.index + 1} 上传失败: ${xhr.status} ${xhr.statusText}`;
+            this.uploadStatus = `分片 ${chunk.index + 1} 上传失败: ${response.data.message}`;
           }
-        };
-        
-        xhr.onerror = () => {
-          console.error('上传网络错误');
-          chunk.status = 'failed';
-          this.uploadStatus = `分片 ${chunk.index + 1} 上传失败: 网络错误`;
-        };
-        
-        xhr.onabort = () => {
-          console.log('上传已中止');
-          chunk.status = 'paused';
-          this.uploadStatus = `分片 ${chunk.index + 1} 上传已暂停`;
-        };
-        
-        xhr.open('POST', '/api/upload/chunk');
-        xhr.send(formData);
-        
-        // 保存xhr引用以便能够中止上传
-        chunk.xhr = xhr;
+        } catch (error) {
+          // 判断是否是用户主动取消的请求
+          if (axios.isCancel(error)) {
+            console.log('上传已中止');
+            chunk.status = 'paused';
+            this.uploadStatus = `分片 ${chunk.index + 1} 上传已暂停`;
+          } else {
+            console.error('上传分片出错:', error);
+            chunk.status = 'failed';
+            this.uploadStatus = `分片 ${chunk.index + 1} 上传失败: ${error.message || '网络错误'}`;
+          }
+        }
       } catch (error) {
         console.error('上传分片出错:', error);
         chunk.status = 'failed';
@@ -578,8 +576,8 @@ export default {
       
       // 中止当前正在上传的请求
       const currentChunk = this.chunks[this.currentChunkIndex];
-      if (currentChunk && currentChunk.xhr) {
-        currentChunk.xhr.abort();
+      if (currentChunk && currentChunk.cancelToken) {
+        currentChunk.cancelToken.cancel('用户暂停上传');
         currentChunk.status = 'paused';
       }
       
@@ -602,8 +600,8 @@ export default {
       
       // 中止当前正在上传的请求
       const currentChunk = this.chunks[this.currentChunkIndex];
-      if (currentChunk && currentChunk.xhr) {
-        currentChunk.xhr.abort();
+      if (currentChunk && currentChunk.cancelToken) {
+        currentChunk.cancelToken.cancel('用户取消上传');
       }
       
       // 清除本地存储的上传状态
