@@ -50,22 +50,113 @@ async function loadHashWasm() {
  * 哈希计算实现说明：
  * 
  * 本Worker实现了两种哈希计算方式，优先使用hash-wasm（更快），降级使用SparkMD5：
+ * 1. hash-wasm方式（首选）：WebAssembly实现，性能比JS快5-20倍
+ * 2. SparkMD5方式（备选）：纯JavaScript实现
  * 
- * 1. hash-wasm方式（首选）：
- *    - 使用WebAssembly二进制实现
- *    - 性能比JavaScript实现快5-20倍
- *    - 内存使用效率更高
- *    - 对大文件处理更快
- * 
- * 2. SparkMD5方式（降级备选）：
- *    - 纯JavaScript实现
- *    - 在不支持WebAssembly的环境中作为备选
- *    - 兼容性更好
- * 
- * 自动判断环境支持情况并选择最优实现。
+ * 同时，每种实现都有两种数据处理模式：
+ * 1. Stream流式处理（首选）：内存效率更高，适合大文件
+ * 2. ArrayBuffer一次性处理（备选）：简单但内存消耗大
  */
 
-// 使用hash-wasm计算MD5哈希值
+// =========================== Stream流方式（新方法）===========================
+
+/**
+ * 使用Stream流方式计算MD5哈希（hash-wasm实现）
+ * 优点：内存使用更高效，适合大文件，避免一次性加载大块数据
+ */
+async function calculateHashWithWasmStream(chunkData, chunkSize = 2097152) {
+  if (!hashWasm || !wasmInitialized) {
+    throw new Error('hash-wasm库未加载或初始化失败');
+  }
+  
+  try {
+    // 如果传入的是ArrayBuffer，需要转换为Blob
+    const blob = chunkData instanceof ArrayBuffer 
+      ? new Blob([chunkData]) 
+      : chunkData;
+    
+    // 创建hash-wasm的增量哈希实例
+    const hasher = await hashWasm.createMD5();
+    
+    // 获取文件流
+    const stream = blob.stream();
+    const reader = stream.getReader();
+    
+    // 读取并处理流
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      
+      // 更新哈希值
+      hasher.update(value);
+    }
+    
+    // 完成哈希计算并返回结果
+    return hasher.digest('hex');
+  } catch (error) {
+    console.error('hash-wasm流式计算失败，错误:', error);
+    throw error;
+  }
+}
+
+/**
+ * 使用Stream流方式计算MD5哈希（SparkMD5实现）
+ * 这是降级方案，当hash-wasm不可用时使用
+ */
+async function calculateHashWithSparkMD5Stream(chunkData, chunkSize = 2097152) {
+  try {
+    // 如果传入的是ArrayBuffer，转换为Blob
+    const blob = chunkData instanceof ArrayBuffer 
+      ? new Blob([chunkData]) 
+      : chunkData;
+    
+    // 创建SparkMD5实例
+    const spark = new SparkMD5.ArrayBuffer();
+    
+    // 分段读取文件处理
+    const fileReader = new FileReader();
+    const totalChunks = Math.ceil(blob.size / chunkSize);
+    
+    // 封装一个Promise，读取整个Blob
+    return new Promise((resolve, reject) => {
+      let currentChunk = 0;
+      
+      fileReader.onload = (e) => {
+        spark.append(e.target.result);
+        currentChunk++;
+        
+        if (currentChunk < totalChunks) {
+          // 继续读取下一块
+          loadNext();
+        } else {
+          // 完成计算
+          resolve(spark.end());
+        }
+      };
+      
+      fileReader.onerror = reject;
+      
+      // 加载下一块数据
+      function loadNext() {
+        const start = currentChunk * chunkSize;
+        const end = Math.min(blob.size, start + chunkSize);
+        const chunk = blob.slice(start, end);
+        fileReader.readAsArrayBuffer(chunk);
+      }
+      
+      // 开始读取第一块
+      loadNext();
+    });
+  } catch (error) {
+    console.error('SparkMD5流式计算失败，错误:', error);
+    throw error;
+  }
+}
+
+// =========================== ArrayBuffer方式（原方法，已注释）===========================
+
+/*
+// 使用hash-wasm计算MD5哈希值（一次性加载整个ArrayBuffer）
 async function calculateHashWithWasm(arrayBuffer) {
   if (!hashWasm || !wasmInitialized) {
     throw new Error('hash-wasm库未加载或初始化失败');
@@ -83,7 +174,7 @@ async function calculateHashWithWasm(arrayBuffer) {
   }
 }
 
-// 使用SparkMD5计算MD5哈希值（降级方案）
+// 使用SparkMD5计算MD5哈希值（一次性处理，降级方案）
 function calculateHashWithSparkMD5(arrayBuffer) {
   // 创建SparkMD5实例，专门用于处理ArrayBuffer
   const spark = new SparkMD5.ArrayBuffer();
@@ -92,6 +183,7 @@ function calculateHashWithSparkMD5(arrayBuffer) {
   // 返回计算结果
   return spark.end();
 }
+*/
 
 // 预加载hash-wasm库
 loadHashWasm().then(success => {
@@ -106,7 +198,21 @@ loadHashWasm().then(success => {
 
 // 监听主线程消息
 self.onmessage = async function(e) {
-  const { arrayBuffer, chunkIndex } = e.data;
+  // 接收数据，支持blob或arrayBuffer两种模式
+  const { blob, arrayBuffer, chunkIndex } = e.data;
+  
+  // 确定实际的数据源（优先使用blob）
+  const chunkData = blob || arrayBuffer;
+  
+  if (!chunkData) {
+    self.postMessage({
+      chunkIndex,
+      error: '未接收到数据',
+      success: false,
+      hashImplementation: "数据错误"
+    });
+    return;
+  }
   
   try {
     let hash;
@@ -120,26 +226,27 @@ self.onmessage = async function(e) {
     // 首先尝试使用hash-wasm（性能更优）
     if (wasmInitialized) {
       try {
-        hash = await calculateHashWithWasm(arrayBuffer);
-        hashImplementation = "hash-wasm (WebAssembly)";
+        // 使用流式计算
+        hash = await calculateHashWithWasmStream(chunkData);
+        hashImplementation = "hash-wasm Stream (WebAssembly)";
         
         // 记录正在使用hash-wasm
         if (chunkIndex === 0) {
-          console.log('正在使用hash-wasm进行高性能哈希计算');
+          console.log('正在使用hash-wasm流式方法进行高性能哈希计算');
         }
       } catch (wasmError) {
-        console.warn('使用hash-wasm计算失败，降级到SparkMD5', wasmError);
-        hash = calculateHashWithSparkMD5(arrayBuffer);
-        hashImplementation = "SparkMD5 (JavaScript) - WASM执行失败";
+        console.warn('使用hash-wasm流式计算失败，降级到SparkMD5', wasmError);
+        hash = await calculateHashWithSparkMD5Stream(chunkData);
+        hashImplementation = "SparkMD5 Stream (JavaScript) - WASM执行失败";
       }
     } else {
       // hash-wasm加载失败或未初始化，使用SparkMD5
-      hash = calculateHashWithSparkMD5(arrayBuffer);
-      hashImplementation = "SparkMD5 (JavaScript) - WASM不可用";
+      hash = await calculateHashWithSparkMD5Stream(chunkData);
+      hashImplementation = "SparkMD5 Stream (JavaScript) - WASM不可用";
       
       // 记录已降级到SparkMD5
       if (chunkIndex === 0) {
-        console.warn('WebAssembly不可用或出错，已降级为SparkMD5进行哈希计算', hashWasmLoadError);
+        console.warn('WebAssembly不可用或出错，已降级为SparkMD5流式计算', hashWasmLoadError);
       }
     }
     

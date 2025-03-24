@@ -70,7 +70,7 @@ export default class HashWorkerPool {
   }
   
   /**
-   * 计算单个文件分片的哈希值
+   * 计算单个文件分片的哈希值 - 使用流式处理
    * 
    * @param {Blob} fileChunk - 文件分片
    * @param {number} chunkIndex - 分片索引
@@ -78,12 +78,21 @@ export default class HashWorkerPool {
    */
   async computeChunkHash(fileChunk, chunkIndex) {
     try {
+      // 记录开始时间用于计算处理时间
+      const startTime = Date.now();
+      
+      // ======== 流式处理方案 ========
+      // 直接传递Blob给Worker，而不是转换为ArrayBuffer
+      // 这样Worker可以使用流式API读取数据
+      const result = await this.pool.exec({
+        blob: fileChunk, // 直接传Blob对象
+        chunkIndex
+      });
+      
+      /* ======== 原ArrayBuffer方案（已注释掉）========
       // 在主线程中将Blob转换为ArrayBuffer
       // 这样可以避免在Worker中进行转换，也避免了结构化克隆Blob对象
       const arrayBuffer = await fileChunk.arrayBuffer();
-      
-      // 记录开始时间用于计算处理时间
-      const startTime = Date.now();
       
       // 使用transfer方式发送ArrayBuffer给工作线程
       // 这会使主线程中的arrayBuffer变为不可用，但避免了数据复制
@@ -91,6 +100,7 @@ export default class HashWorkerPool {
         arrayBuffer,
         chunkIndex
       }, [arrayBuffer]); // 第二个参数是transferList
+      */
       
       // 计算处理时间
       const endTime = Date.now();
